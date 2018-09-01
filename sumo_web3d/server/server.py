@@ -20,6 +20,13 @@ import sumolib
 import traci
 from .xml_utils import get_only_key, parse_xml_file
 
+# flow things
+from flow.utils.registry import make_create_env
+from flow.utils.rllib import get_flow_params
+from ray.tune.registry import register_env
+from flow.core.util import get_rllib_config
+
+
 tc = traci.constants
 
 parser = argparse.ArgumentParser(description='Run the microsim python server.')
@@ -34,6 +41,9 @@ parser.add_argument(
 parser.add_argument(
     '--gui', action='store_true', default=False,
     help='Run sumo-gui rather than sumo. This is useful for debugging.')
+parser.add_argument(
+    "result_dir", type=str, help="Directory containing results")
+parser.add_argument("checkpoint_num", type=str, help="Checkpoint number.")
 
 # Base directory for sumo_web3d
 DIR = os.path.join(os.path.dirname(__file__), '..')
@@ -394,6 +404,14 @@ def simulate_next_step():
     }
     last_vehicles = vehicles
     last_lights = lights
+
+    # FIXME vehicles are crashing even though the cfgs are the same. Why?
+
+    # FIXME here you need to do
+    # 1. get action from the env
+    # 2.
+    speed = traci.traci_connection.vehicle.getSpeed('rl_0')
+    traci.traci_connection.vehicle.slowDown('rl_0', speed + acceleration, 1)
     return snapshot
 
 
@@ -540,6 +558,59 @@ def setup_http_server(task, scenario_file, scenarios):
 
 def main(args):
     global current_scenario, scenarios, SCENARIOS_PATH
+
+    # parse the flow args
+    if args.result_dir:
+        result_dir = args.result_dir if args.result_dir[-1] != '/' \
+            else args.result_dir[:-1]
+    checkpoint = result_dir + '/checkpoint-' + args.checkpoint_num
+    config = get_rllib_config(result_dir)
+
+    flow_params = get_flow_params(config)
+
+    # Create and register a gym+rllib env
+    create_env, env_name = make_create_env(
+        params=flow_params, version=0, sumo_binary="sumo")
+    register_env(env_name, create_env)
+
+    agent = agent_cls(env=env_name, registry=get_registry(), config=config)
+    checkpoint = result_dir + '/checkpoint-' + args.checkpoint_num
+    agent._restore(checkpoint)
+
+    # Recreate the scenario from the pickled parameters
+    exp_tag = flow_params["exp_tag"]
+    net_params = flow_params['net']
+    vehicles = flow_params['veh']
+    initial_config = flow_params['initial']
+    module = __import__("flow.scenarios", fromlist=[flow_params["scenario"]])
+    scenario_class = getattr(module, flow_params["scenario"])
+    module = __import__("flow.scenarios", fromlist=[flow_params["generator"]])
+    generator_class = getattr(module, flow_params["generator"])
+
+    scenario = scenario_class(
+        name=exp_tag,
+        generator_class=generator_class,
+        vehicles=vehicles,
+        net_params=net_params,
+        initial_config=initial_config)
+
+    # Start the environment with the gui turned on and a path for the
+    # emission file
+    module = __import__("flow.envs", fromlist=[flow_params["env_name"]])
+    env_class = getattr(module, flow_params["env_name"])
+    env_params = flow_params['env']
+    sumo_params = flow_params['sumo']
+    sumo_params.sumo_binary = "sumo-gui"
+    sumo_params.emission_path = "./test_time_rollout/"
+
+    # FIXME this will actually start sumo, since base_env in flow
+    # comes with a call to start sumo
+    env = env_class(
+        env_params=env_params, sumo_params=sumo_params, scenario=scenario)
+
+    # now that you have the env, you need to pass it to next_simulation_step
+    # so you can use it to feed actions
+
     task = None
     sumo_start_fn = functools.partial(start_sumo_executable, args.gui, args.sumo_args)
 
