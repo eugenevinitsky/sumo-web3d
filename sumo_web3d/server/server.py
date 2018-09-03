@@ -25,6 +25,9 @@ from flow.utils.registry import make_create_env
 from flow.utils.rllib import get_flow_params
 from ray.tune.registry import register_env
 from flow.core.util import get_rllib_config
+from ray.rllib.agents.agent import get_agent_class
+import ray
+
 
 
 tc = traci.constants
@@ -85,6 +88,8 @@ scenarios = {}  # map from kebab-case-name to Scenario object.
 
 last_vehicles = {}
 last_lights = {}
+env = None
+agent = None
 
 
 # meant to be used as decorator, will not work with coroutines
@@ -297,7 +302,7 @@ async def run_simulation(websocket):
 
 
 def cleanup_sumo_simulation(simulation_task):
-    global last_lights, last_vehicles
+    global last_lights, last_vehicles, env, agent
     if simulation_task:
         if simulation_task.cancel():
             simulation_task = None
@@ -345,7 +350,9 @@ def start_sumo_executable(gui, sumo_args, sumocfg_file):
     sumoBinary = sumolib.checkBinary('sumo' if not gui else 'sumo-gui')
     additional_args = shlex.split(sumo_args) if sumo_args else []
     args = [sumoBinary, '-c', sumocfg_file] + additional_args
+    #args += ['--remote-port', '5500']
     print('Executing %s' % ' '.join(args))
+    import ipdb; ipdb.set_trace()
     traci.start(args)
     traci.simulation.subscribe()
 
@@ -358,7 +365,7 @@ def start_sumo_executable(gui, sumo_args, sumocfg_file):
 
 
 def simulate_next_step():
-    global last_lights, last_vehicles
+    global last_lights, last_vehicles, env, agent
     start_secs = time.time()
     traci.simulationStep()
     end_sim_secs = time.time()
@@ -406,10 +413,8 @@ def simulate_next_step():
     last_lights = lights
 
     # FIXME vehicles are crashing even though the cfgs are the same. Why?
-
-    # FIXME here you need to do
-    # 1. get action from the env
-    # 2.
+    state = env.get_state
+    acceleration = agent.compute_action(state)
     speed = traci.traci_connection.vehicle.getSpeed('rl_0')
     traci.traci_connection.vehicle.slowDown('rl_0', speed + acceleration, 1)
     return snapshot
@@ -557,13 +562,15 @@ def setup_http_server(task, scenario_file, scenarios):
 
 
 def main(args):
-    global current_scenario, scenarios, SCENARIOS_PATH
+    global current_scenario, scenarios, SCENARIOS_PATH, agent, env
 
+    ray.init(num_cpus=5)
+
+    result_dir = None
     # parse the flow args
     if args.result_dir:
         result_dir = args.result_dir if args.result_dir[-1] != '/' \
             else args.result_dir[:-1]
-    checkpoint = result_dir + '/checkpoint-' + args.checkpoint_num
     config = get_rllib_config(result_dir)
 
     flow_params = get_flow_params(config)
@@ -573,9 +580,11 @@ def main(args):
         params=flow_params, version=0, sumo_binary="sumo")
     register_env(env_name, create_env)
 
-    agent = agent_cls(env=env_name, registry=get_registry(), config=config)
+    agent_cls = get_agent_class("PPO")
+    config["num_workers"] = 1
+    agent = agent_cls(env=env_name, config=config)
     checkpoint = result_dir + '/checkpoint-' + args.checkpoint_num
-    agent._restore(checkpoint)
+    agent.restore(checkpoint)
 
     # Recreate the scenario from the pickled parameters
     exp_tag = flow_params["exp_tag"]
@@ -600,13 +609,17 @@ def main(args):
     env_class = getattr(module, flow_params["env_name"])
     env_params = flow_params['env']
     sumo_params = flow_params['sumo']
-    sumo_params.sumo_binary = "sumo-gui"
+    sumo_params.sumo_binary = "sumo"
     sumo_params.emission_path = "./test_time_rollout/"
 
     # FIXME this will actually start sumo, since base_env in flow
     # comes with a call to start sumo
+    # make it start on the same port!
+    # got to set up sumo with two ports
     env = env_class(
         env_params=env_params, sumo_params=sumo_params, scenario=scenario)
+    env.sumo_params.port = 5500
+    env.restart_sumo(env.sumo_params)
 
     # now that you have the env, you need to pass it to next_simulation_step
     # so you can use it to feed actions
